@@ -27,7 +27,7 @@ function Limiter(opts) {
   assert(this.db, '.db required');
   this.max = opts.max || 2500;
   this.duration = opts.duration || 3600000;
-  this.prefix = 'limit:' + this.id + ':';
+  this.prefix = 'limit:' + this.id;
 }
 
 /**
@@ -58,20 +58,21 @@ Limiter.prototype.inspect = function () {
  */
 
 Limiter.prototype.get = function (fn) {
-  var count = this.prefix + 'count';
-  var limit = this.prefix + 'limit';
-  var reset = this.prefix + 'reset';
-  var duration = this.duration;
-  var max = this.max;
+  
   var db = this.db;
+  var entryName = this.prefix;
+  var duration = this.duration;
+  
+  var entry = {
+      'count': this.max,
+      'limit': this.max
+    };
 
   function create() {
-    var ex = (Date.now() + duration) / 1000 | 0;
-
+    entry.reset = (Date.now() + duration) / 1000 | 0;
+    
     db.multi()
-      .set([count, max, 'PX', duration, 'NX'])
-      .set([limit, max, 'PX', duration, 'NX'])
-      .set([reset, ex, 'PX', duration, 'NX'])
+      .set([entryName, JSON.stringify(entry), 'PX', duration, 'NX'])
       .exec(function (err, res) {
         if (err) return fn(err);
 
@@ -80,48 +81,48 @@ Limiter.prototype.get = function (fn) {
         if (isFirstReplyNull(res)) return mget();
 
         fn(null, {
-          total: max,
-          remaining: max,
-          reset: ex
+          total: entry.count,
+          remaining: entry.limit,
+          reset: entry.reset
         });
       });
   }
 
   function decr(res) {
-    var n = ~~res[0];
-    var max = ~~res[1];
-    var ex = ~~res[2];
+    var entry = JSON.parse(res);
+    var tmpEntry = JSON.parse(res);
     var dateNow = Date.now();
 
-    if (n <= 0) return done();
-
+    if (entry.count <= 0) return done();
+    
     function done() {
       fn(null, {
-        total: max,
-        remaining: n < 0 ? 0 : n,
-        reset: ex
+        total: entry.limit,
+        remaining: entry.count < 0 ? 0 : entry.count,
+        reset: entry.reset
       });
     }
 
+    tmpEntry.count--;
     db.multi()
-      .set([count, n - 1, 'PX', ex * 1000 - dateNow, 'XX'])
-      .pexpire([limit, ex * 1000 - dateNow])
-      .pexpire([reset, ex * 1000 - dateNow])
+      .set([entryName, JSON.stringify(tmpEntry), 'PX', entry.reset * 1000 - dateNow, 'XX'])
       .exec(function (err, res) {
         if (err) return fn(err);
         if (isFirstReplyNull(res)) return mget();
-        n = n - 1;
+        
+        entry.count--;
         done();
       });
   }
 
-  function mget() {
-    db.watch([count], function (err) {
+  function mget() {    
+    db.watch([entryName], function (err)
+    {
       if (err) return fn(err);
-      db.mget([count, limit, reset], function (err, res) {
+      db.get(entryName, function (err, res) {
         if (err) return fn(err);
-        if (!res[0] && res[0] !== 0) return create();
-
+        if (res === null) return create();
+      
         decr(res);
       });
     });
